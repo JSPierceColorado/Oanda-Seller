@@ -185,10 +185,20 @@ def close_position(instrument: str, side: str):
 # -------------------------
 
 def get_gspread_client():
+    """
+    Build a gspread client from the GOOGLE_CREDS_JSON env var.
+
+    IMPORTANT CHANGE:
+    - Added Drive scope so gspread can search by spreadsheet title
+      (client.open(SPREADSHEET_NAME)) without 403 errors.
+    """
     creds_info = json.loads(GOOGLE_CREDS_JSON)
     creds = service_account.Credentials.from_service_account_info(
         creds_info,
-        scopes=["https://www.googleapis.com/auth/spreadsheets"]
+        scopes=[
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ],
     )
     return gspread.authorize(creds)
 
