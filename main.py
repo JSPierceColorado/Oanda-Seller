@@ -30,12 +30,11 @@ SPREADSHEET_NAME = os.getenv("SPREADSHEET_NAME", "Active-Investing")
 WORKSHEET_NAME = os.getenv("WORKSHEET_NAME", "Oanda-Trader")
 
 # Risk / trade logic
-# STOP_LOSS_PCT is the env var you requested (positive number, e.g. 5 for -5%)
-STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "5"))
-
-# Arming and trailing TP thresholds (can be env tuned if you like)
-ARM_THRESHOLD_PCT = float(os.getenv("ARM_THRESHOLD_PCT", "5"))   # +5% -> becomes armed
-TRAIL_OFFSET_PCT = float(os.getenv("TRAIL_OFFSET_PCT", "3"))     # sell when 3% below ATH
+# Values are percentages, e.g. 0.3 = 0.3% move on price
+# (10x tighter than previous 3% / 5% / 3% configuration)
+STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.3"))        # was 3
+ARM_THRESHOLD_PCT = float(os.getenv("ARM_THRESHOLD_PCT", "0.5"))  # was 5
+TRAIL_OFFSET_PCT = float(os.getenv("TRAIL_OFFSET_PCT", "0.3"))    # was 3
 
 # Approximate commission settings.
 # This is a *rough* approximation for accounts with a commission structure,
@@ -51,6 +50,11 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 
+logging.info(
+    f"Using risk settings: STOP_LOSS_PCT={STOP_LOSS_PCT}%, "
+    f"ARM_THRESHOLD_PCT={ARM_THRESHOLD_PCT}%, "
+    f"TRAIL_OFFSET_PCT={TRAIL_OFFSET_PCT}%"
+)
 
 # -------------------------
 # Oanda API helpers
