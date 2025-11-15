@@ -37,6 +37,12 @@ STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "5"))
 ARM_THRESHOLD_PCT = float(os.getenv("ARM_THRESHOLD_PCT", "5"))   # +5% -> becomes armed
 TRAIL_OFFSET_PCT = float(os.getenv("TRAIL_OFFSET_PCT", "3"))     # sell when 3% below ATH
 
+# Approximate commission settings.
+# This is a *rough* approximation for accounts with a commission structure,
+# expressed as cost per 1,000,000 units (per side) in account/quote currency.
+# Set to 0.0 if your account is spread-only.
+COMMISSION_PER_MILLION = 50.0
+
 # Loop interval
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
 
@@ -73,7 +79,7 @@ def fetch_open_positions():
         "units": float,
         "entry_price": float,
         "current_price": float,
-        "profit_pct": float,
+        "profit_pct": float,   # approximate, net of estimated commission
     }
     """
     url = f"{oanda_base_url()}/accounts/{OANDA_ACCOUNT_ID}/openPositions"
@@ -93,8 +99,8 @@ def fetch_open_positions():
 
     for p in raw_positions:
         instrument = p["instrument"]
-        current_price = prices_map.get(instrument)
-        if current_price is None:
+        price_info = prices_map.get(instrument)
+        if price_info is None:
             logging.warning(f"No current price for instrument {instrument}, skipping.")
             continue
 
@@ -109,10 +115,25 @@ def fetch_open_positions():
 
             entry_price = float(side_data["averagePrice"])
 
+            # Use side-appropriate price (bid for longs, ask for shorts)
             if side_label == "LONG":
-                profit_pct = (current_price - entry_price) / entry_price * 100.0
+                current_price = price_info["bid"]
+                raw_profit_pct = (current_price - entry_price) / entry_price * 100.0
             else:  # SHORT
-                profit_pct = (entry_price - current_price) / entry_price * 100.0
+                current_price = price_info["ask"]
+                raw_profit_pct = (entry_price - current_price) / entry_price * 100.0
+
+            # --- Approximate commission impact ---
+            # We estimate commission already paid on the opening side as:
+            # commission_cash = COMMISSION_PER_MILLION * (abs(units) / 1_000_000)
+            # and express it as a percent of notional (units * entry_price).
+            notional = abs(units) * entry_price
+            commission_pct = 0.0
+            if COMMISSION_PER_MILLION > 0.0 and notional > 0.0:
+                commission_cash = COMMISSION_PER_MILLION * (abs(units) / 1_000_000.0)
+                commission_pct = (commission_cash / notional) * 100.0
+
+            profit_pct = raw_profit_pct - commission_pct
 
             positions.append(
                 {
@@ -130,8 +151,8 @@ def fetch_open_positions():
 
 def fetch_current_prices(instruments):
     """
-    Fetch mid prices for a list of instruments.
-    Returns: {instrument: mid_price}
+    Fetch bid/ask prices for a list of instruments.
+    Returns: {instrument: {"bid": float, "ask": float}}
     """
     if not instruments:
         return {}
@@ -153,8 +174,11 @@ def fetch_current_prices(instruments):
             continue
         bid = float(bids[0]["price"])
         ask = float(asks[0]["price"])
-        mid = (bid + ask) / 2.0
-        prices_map[instrument] = mid
+
+        prices_map[instrument] = {
+            "bid": bid,
+            "ask": ask,
+        }
 
     return prices_map
 
