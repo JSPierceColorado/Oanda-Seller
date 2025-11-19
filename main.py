@@ -31,16 +31,19 @@ WORKSHEET_NAME = os.getenv("WORKSHEET_NAME", "Oanda-Trader")
 
 # Risk / trade logic
 # Values are percentages, e.g. 0.3 = 0.3% move on price
-# (10x tighter than previous 3% / 5% / 3% configuration)
-STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.3"))        # was 3
-ARM_THRESHOLD_PCT = float(os.getenv("ARM_THRESHOLD_PCT", "0.5"))  # was 5
-TRAIL_OFFSET_PCT = float(os.getenv("TRAIL_OFFSET_PCT", "0.3"))    # was 3
+STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.3"))  # hard stop, e.g. 0.3%
+
+# New trailing logic:
+# TRAIL_GIVEBACK_FRACTION: fraction of peak profit we allow to be given back, e.g. 0.3 = 30%
+# MIN_TRAIL_DROP_PCT: minimum absolute drawdown between ATH and exit, e.g. 0.2 = 0.2%
+TRAIL_GIVEBACK_FRACTION = float(os.getenv("TRAIL_GIVEBACK_FRACTION", "0.3"))
+MIN_TRAIL_DROP_PCT = float(os.getenv("MIN_TRAIL_DROP_PCT", "0.2"))
 
 # Approximate commission settings.
 # This is a *rough* approximation for accounts with a commission structure,
 # expressed as cost per 1,000,000 units (per side) in account/quote currency.
 # Set to 0.0 if your account is spread-only.
-COMMISSION_PER_MILLION = 50.0
+COMMISSION_PER_MILLION = float(os.getenv("COMMISSION_PER_MILLION", "50.0"))
 
 # Loop interval
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
@@ -51,14 +54,18 @@ logging.basicConfig(
 )
 
 logging.info(
-    f"Using risk settings: STOP_LOSS_PCT={STOP_LOSS_PCT}%, "
-    f"ARM_THRESHOLD_PCT={ARM_THRESHOLD_PCT}%, "
-    f"TRAIL_OFFSET_PCT={TRAIL_OFFSET_PCT}%"
+    f"Using risk settings: "
+    f"STOP_LOSS_PCT={STOP_LOSS_PCT}%, "
+    f"TRAIL_GIVEBACK_FRACTION={TRAIL_GIVEBACK_FRACTION}, "
+    f"MIN_TRAIL_DROP_PCT={MIN_TRAIL_DROP_PCT}%, "
+    f"COMMISSION_PER_MILLION={COMMISSION_PER_MILLION}, "
+    f"POLL_INTERVAL_SECONDS={POLL_INTERVAL_SECONDS}"
 )
 
 # -------------------------
 # Oanda API helpers
 # -------------------------
+
 
 def oanda_base_url() -> str:
     if OANDA_ENV == "live":
@@ -212,12 +219,13 @@ def close_position(instrument: str, side: str):
 # Google Sheets helpers
 # -------------------------
 
+
 def get_gspread_client():
     """
     Build a gspread client from the GOOGLE_CREDS_JSON env var.
 
-    IMPORTANT CHANGE:
-    - Added Drive scope so gspread can search by spreadsheet title
+    IMPORTANT:
+    - Drive scope is added so gspread can search by spreadsheet title
       (client.open(SPREADSHEET_NAME)) without 403 errors.
     """
     creds_info = json.loads(GOOGLE_CREDS_JSON)
@@ -245,6 +253,9 @@ def load_prior_state(ws):
     Reads current sheet and builds a state map:
     key -> {"armed": bool, "ath_pct": float}
     where key = f"{Instrument}|{Side}"
+
+    'armed' here means "this position has been in positive profit at some point"
+    under the new trailing-logic interpretation.
     """
     try:
         records = ws.get_all_records()
@@ -319,12 +330,20 @@ def write_positions_to_sheet(ws, positions, state_map):
 # Trading logic
 # -------------------------
 
+
 def apply_trading_logic(positions, prior_state):
     """
-    Takes raw positions and prior state, decides what to close, and
-    returns:
-      - remaining_positions: list of positions that stay open
-      - new_state: updated state map for remaining positions
+    New trailing logic:
+
+    - Always enforce a hard STOP_LOSS_PCT.
+    - Track all-time-high profit pct (ath_pct) for each position side.
+    - Once a position has been in positive territory (ath_pct > 0),
+      allow it to give back only a fraction of that peak profit before closing:
+         allowed_drawdown = max(MIN_TRAIL_DROP_PCT, ath_pct * TRAIL_GIVEBACK_FRACTION)
+         exit_level       = ath_pct - allowed_drawdown
+      If current profit_pct <= exit_level, close the position.
+
+    'armed' in the sheet now simply means "this position has been > 0% at some point".
     """
     remaining_positions = []
     new_state = {}
@@ -332,46 +351,59 @@ def apply_trading_logic(positions, prior_state):
     for pos in positions:
         key = f"{pos['instrument']}|{pos['side']}"
         prev = prior_state.get(key, {"armed": False, "ath_pct": 0.0})
-        armed = prev["armed"]
-        ath_pct = prev["ath_pct"]
+
+        prev_ath = float(prev.get("ath_pct", 0.0))
         profit_pct = pos["profit_pct"]
 
-        # --- Stop Loss (applies always) ---
+        # 1) Hard stop loss always active
         if profit_pct <= -STOP_LOSS_PCT:
             logging.info(
-                f"{key}: Profit {profit_pct:.2f}% <= -STOP_LOSS_PCT (-{STOP_LOSS_PCT}%), triggering STOP LOSS sell."
+                f"{key}: Profit {profit_pct:.2f}% <= -STOP_LOSS_PCT (-{STOP_LOSS_PCT}%), "
+                f"triggering STOP LOSS sell."
             )
             close_position(pos["instrument"], pos["side"])
-            continue  # do not keep in remaining_positions
+            continue
 
-        # --- Arming logic ---
-        if not armed and profit_pct >= ARM_THRESHOLD_PCT:
-            armed = True
+        # 2) Update ATH: only track positive territory
+        ath_pct = prev_ath
+        if profit_pct > 0.0 and profit_pct > prev_ath:
             ath_pct = profit_pct
+            logging.info(f"{key}: New all-time high profit {ath_pct:.2f}%.")
+
+        # Determine if position has ever been positive
+        has_been_positive = ath_pct > 0.0
+
+        # 3) If never positive, just leave it open with hard SL only
+        if not has_been_positive:
+            remaining_positions.append(pos)
+            new_state[key] = {
+                "armed": False,   # has not been > 0% yet
+                "ath_pct": ath_pct,
+            }
+            continue
+
+        # 4) Percentage giveback trailing
+        allowed_drawdown = max(
+            MIN_TRAIL_DROP_PCT,
+            ath_pct * TRAIL_GIVEBACK_FRACTION,
+        )
+        exit_level = ath_pct - allowed_drawdown
+
+        if profit_pct <= exit_level:
             logging.info(
-                f"{key}: Position became ARMED at {profit_pct:.2f}% (threshold {ARM_THRESHOLD_PCT}%)."
+                f"{key}: Profit {profit_pct:.2f}% <= ATH({ath_pct:.2f}%) - "
+                f"allowed_drawdown({allowed_drawdown:.2f}%), triggering "
+                f"TRAILING GIVEBACK sell at level {exit_level:.2f}%."
             )
+            close_position(pos["instrument"], pos["side"])
+            continue
 
-        # --- ATH tracking for armed positions ---
-        if armed:
-            if profit_pct > ath_pct:
-                ath_pct = profit_pct
-                logging.info(
-                    f"{key}: New all-time high profit {ath_pct:.2f}%."
-                )
-
-            # Trailing TP: sell if we've fallen TRAIL_OFFSET_PCT below ATH
-            if profit_pct <= ath_pct - TRAIL_OFFSET_PCT:
-                logging.info(
-                    f"{key}: Profit {profit_pct:.2f}% <= ATH({ath_pct:.2f}%) - TRAIL_OFFSET({TRAIL_OFFSET_PCT}%), "
-                    f"triggering TRAILING TP sell."
-                )
-                close_position(pos["instrument"], pos["side"])
-                continue  # sold, do not keep
-
-        # Still open
+        # 5) Still open; record updated state
         remaining_positions.append(pos)
-        new_state[key] = {"armed": armed, "ath_pct": ath_pct}
+        new_state[key] = {
+            "armed": True,      # has been > 0% at some point
+            "ath_pct": ath_pct,
+        }
 
     return remaining_positions, new_state
 
@@ -380,8 +412,9 @@ def apply_trading_logic(positions, prior_state):
 # Main loop
 # -------------------------
 
+
 def main_loop():
-    logging.info("Starting Oanda-Trader loop.")
+    logging.info("Starting Oanda-Trader loop with percentage-giveback trailing logic.")
 
     client = get_gspread_client()
     ws = get_or_create_worksheet(client)
