@@ -48,6 +48,34 @@ COMMISSION_PER_MILLION = float(os.getenv("COMMISSION_PER_MILLION", "50.0"))
 # Loop interval
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
 
+# Closed-trades log starts in this column (side-by-side)
+CLOSED_TRADES_START_COL = os.getenv("CLOSED_TRADES_START_COL", "K")  # default: column K
+
+OPEN_HEADER = [
+    "Instrument",
+    "Side",
+    "Units",
+    "EntryPrice",
+    "CurrentPrice",
+    "ProfitPct",
+    "Armed",
+    "AllTimeHighPct",
+    "LastUpdatedUTC",
+]
+
+CLOSED_HEADER = [
+    "ClosedInstrument",
+    "ClosedSide",
+    "ClosedUnits",
+    "ClosedEntryPrice",
+    "ClosedExitPrice",
+    "ClosedProfitPct",
+    "ClosedArmed",
+    "CloseReason",            # e.g. STOP_LOSS, TRAILING_GIVEBACK
+    "ClosedAllTimeHighPct",
+    "ClosedAtUTC",
+]
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -79,6 +107,40 @@ def oanda_headers() -> dict:
         "Authorization": f"Bearer {OANDA_API_KEY}",
         "Content-Type": "application/json"
     }
+
+
+def fetch_current_prices(instruments):
+    """
+    Fetch bid/ask prices for a list of instruments.
+    Returns: {instrument: {"bid": float, "ask": float}}
+    """
+    if not instruments:
+        return {}
+
+    url = f"{oanda_base_url()}/accounts/{OANDA_ACCOUNT_ID}/pricing"
+    params = {
+        "instruments": ",".join(instruments)
+    }
+    resp = requests.get(url, headers=oanda_headers(), params=params, timeout=10)
+    resp.raise_for_status()
+    data = resp.json()
+
+    prices_map = {}
+    for p in data.get("prices", []):
+        instrument = p["instrument"]
+        bids = p.get("bids", [])
+        asks = p.get("asks", [])
+        if not bids or not asks:
+            continue
+        bid = float(bids[0]["price"])
+        ask = float(asks[0]["price"])
+
+        prices_map[instrument] = {
+            "bid": bid,
+            "ask": ask,
+        }
+
+    return prices_map
 
 
 def fetch_open_positions():
@@ -160,40 +222,6 @@ def fetch_open_positions():
     return positions
 
 
-def fetch_current_prices(instruments):
-    """
-    Fetch bid/ask prices for a list of instruments.
-    Returns: {instrument: {"bid": float, "ask": float}}
-    """
-    if not instruments:
-        return {}
-
-    url = f"{oanda_base_url()}/accounts/{OANDA_ACCOUNT_ID}/pricing"
-    params = {
-        "instruments": ",".join(instruments)
-    }
-    resp = requests.get(url, headers=oanda_headers(), params=params, timeout=10)
-    resp.raise_for_status()
-    data = resp.json()
-
-    prices_map = {}
-    for p in data.get("prices", []):
-        instrument = p["instrument"]
-        bids = p.get("bids", [])
-        asks = p.get("asks", [])
-        if not bids or not asks:
-            continue
-        bid = float(bids[0]["price"])
-        ask = float(asks[0]["price"])
-
-        prices_map[instrument] = {
-            "bid": bid,
-            "ask": ask,
-        }
-
-    return prices_map
-
-
 def close_position(instrument: str, side: str):
     """
     Close entire position for an instrument and side.
@@ -220,6 +248,28 @@ def close_position(instrument: str, side: str):
 # -------------------------
 
 
+def _col_to_index(col_letter: str) -> int:
+    """
+    Convert a column letter (e.g. 'A', 'K') to a 1-based index.
+    """
+    col_letter = col_letter.upper()
+    idx = 0
+    for c in col_letter:
+        idx = idx * 26 + (ord(c) - ord("A") + 1)
+    return idx
+
+
+def _index_to_col(index: int) -> str:
+    """
+    Convert a 1-based column index to letters (e.g. 1 -> 'A', 11 -> 'K').
+    """
+    result = []
+    while index > 0:
+        index, rem = divmod(index - 1, 26)
+        result.append(chr(rem + ord("A")))
+    return "".join(reversed(result))
+
+
 def get_gspread_client():
     """
     Build a gspread client from the GOOGLE_CREDS_JSON env var.
@@ -239,42 +289,94 @@ def get_gspread_client():
     return gspread.authorize(creds)
 
 
+def init_worksheet(ws):
+    """
+    Ensure the worksheet has:
+    - Open positions header in A1:I1
+    - Closed trades header starting at CLOSED_TRADES_START_COL row 1
+    """
+    # Open positions header (A1:I1)
+    try:
+        open_header_row = ws.row_values(1)
+    except Exception as e:
+        logging.warning(f"Could not read row 1 for init: {e}")
+        open_header_row = []
+
+    if not open_header_row:
+        logging.info("Initializing open-positions header in A1.")
+        ws.update("A1", [OPEN_HEADER])
+
+    # Closed trades header (e.g. K1:??1)
+    start_col = CLOSED_TRADES_START_COL
+    start_idx = _col_to_index(start_col)
+    end_idx = start_idx + len(CLOSED_HEADER) - 1
+    end_col = _index_to_col(end_idx)
+    header_range = f"{start_col}1:{end_col}1"
+
+    try:
+        closed_header_values = ws.get(header_range)
+    except Exception as e:
+        logging.warning(f"Could not read closed-trades header row: {e}")
+        closed_header_values = []
+
+    # If that range is empty or first row blank, write header
+    if not closed_header_values or not closed_header_values[0]:
+        logging.info(f"Initializing closed-trades header in {header_range}.")
+        ws.update(header_range, [CLOSED_HEADER])
+
+
 def get_or_create_worksheet(client):
     spreadsheet = client.open(SPREADSHEET_NAME)
     try:
         ws = spreadsheet.worksheet(WORKSHEET_NAME)
     except gspread.WorksheetNotFound:
-        ws = spreadsheet.add_worksheet(title=WORKSHEET_NAME, rows=200, cols=20)
+        ws = spreadsheet.add_worksheet(title=WORKSHEET_NAME, rows=2000, cols=30)
+
+    init_worksheet(ws)
     return ws
 
 
 def load_prior_state(ws):
     """
-    Reads current sheet and builds a state map:
-    key -> {"armed": bool, "ath_pct": float}
+    Reads open-positions snapshot in columns A..I (all rows) and builds:
+        key -> {"armed": bool, "ath_pct": float}
     where key = f"{Instrument}|{Side}"
-
-    'armed' here means "this position has been in positive profit at some point"
-    under the new trailing-logic interpretation.
     """
     try:
-        records = ws.get_all_records()
+        values = ws.get_all_values()
     except Exception as e:
         logging.warning(f"Could not read existing sheet state: {e}")
         return {}
 
+    if not values:
+        return {}
+
+    # Only consider the first len(OPEN_HEADER) columns (A..I) for state.
+    header_row = values[0][:len(OPEN_HEADER)]
+    col_idx = {name: i for i, name in enumerate(header_row)}
+
+    def safe_get(row, name, default=""):
+        idx = col_idx.get(name)
+        if idx is None:
+            return default
+        if idx >= len(row):
+            return default
+        return row[idx]
+
     state = {}
-    for row in records:
-        instr = row.get("Instrument")
-        side = row.get("Side")
+    for row in values[1:]:
+        row = row[:len(OPEN_HEADER)]
+        instr = safe_get(row, "Instrument")
+        side = safe_get(row, "Side")
         if not instr or not side:
             continue
+
         key = f"{instr}|{side}"
 
-        armed_raw = str(row.get("Armed", "")).strip().lower()
+        armed_raw = str(safe_get(row, "Armed", "")).strip().lower()
         armed = armed_raw in ("true", "1", "yes", "y")
 
-        ath_raw = row.get("AllTimeHighPct", 0)
+        ath_raw = safe_get(row, "AllTimeHighPct", 0)
         try:
             ath_pct = float(ath_raw) if ath_raw not in ("", None) else 0.0
         except ValueError:
@@ -289,22 +391,13 @@ def write_positions_to_sheet(ws, positions, state_map):
     """
     positions: list of current open positions (after selling logic)
     state_map: key -> {"armed": bool, "ath_pct": float} for those still open
-    """
-    header = [
-        "Instrument",
-        "Side",
-        "Units",
-        "EntryPrice",
-        "CurrentPrice",
-        "ProfitPct",
-        "Armed",
-        "AllTimeHighPct",
-        "LastUpdatedUTC",
-    ]
 
+    Writes the live-snapshot table in A..I, without touching the closed-trades
+    log on the right.
+    """
     now_str = datetime.now(timezone.utc).isoformat()
 
-    rows = [header]
+    rows = [OPEN_HEADER]
     for pos in positions:
         key = f"{pos['instrument']}|{pos['side']}"
         state = state_map.get(key, {"armed": False, "ath_pct": 0.0})
@@ -321,9 +414,63 @@ def write_positions_to_sheet(ws, positions, state_map):
             now_str,
         ])
 
-    # Clear & overwrite
-    ws.clear()
-    ws.update("A1", rows, value_input_option="USER_ENTERED")
+    # Determine how many existing rows are in the open-positions area (column A)
+    try:
+        existing_rows = len(ws.col_values(1))  # number of non-empty rows in column A
+    except Exception as e:
+        logging.warning(f"Could not determine existing open-positions rows: {e}")
+        existing_rows = 0
+
+    # Clear only the existing open-positions block in A..I (rows 2..existing_rows)
+    if existing_rows > 1:
+        try:
+            ws.batch_clear([f"A2:I{existing_rows}"])
+        except AttributeError:
+            # Fallback if batch_clear isn't available
+            blank_rows = [[""] * len(OPEN_HEADER)] * (existing_rows - 1)
+            ws.update(f"A2:I{existing_rows}", blank_rows)
+
+    # Rewrite header + open positions
+    if rows:
+        ws.update("A1", rows, value_input_option="USER_ENTERED")
+
+
+def log_closed_trade(ws, pos, armed: bool, ath_pct: float, close_reason: str):
+    """
+    Append a closed-trade row into the log area on the right side of the sheet.
+
+    pos: position dict from fetch_open_positions()
+    armed: whether the position has ever been > 0%
+    ath_pct: all-time-high profit percentage
+    close_reason: 'STOP_LOSS' or 'TRAILING_GIVEBACK'
+    """
+    closed_at = datetime.now(timezone.utc).isoformat()
+
+    row = [
+        pos["instrument"],
+        pos["side"],
+        pos["units"],
+        round(pos["entry_price"], 6),
+        round(pos["current_price"], 6),   # snapshot exit price
+        round(pos["profit_pct"], 4),
+        str(armed),
+        close_reason,
+        round(ath_pct, 4),
+        closed_at,
+    ]
+
+    start_col = CLOSED_TRADES_START_COL
+    start_idx = _col_to_index(start_col)
+    end_idx = start_idx + len(CLOSED_HEADER) - 1
+    end_col = _index_to_col(end_idx)
+
+    table_range = f"{start_col}1:{end_col}1"
+
+    ws.append_row(
+        row,
+        table_range=table_range,
+        value_input_option="USER_ENTERED",
+    )
 
 
 # -------------------------
@@ -331,9 +478,9 @@ def write_positions_to_sheet(ws, positions, state_map):
 # -------------------------
 
 
-def apply_trading_logic(positions, prior_state):
+def apply_trading_logic(positions, prior_state, ws):
     """
-    New trailing logic:
+    New trailing logic with closed-trade logging:
 
     - Always enforce a hard STOP_LOSS_PCT.
     - Track all-time-high profit pct (ath_pct) for each position side.
@@ -343,7 +490,10 @@ def apply_trading_logic(positions, prior_state):
          exit_level       = ath_pct - allowed_drawdown
       If current profit_pct <= exit_level, close the position.
 
-    'armed' in the sheet now simply means "this position has been > 0% at some point".
+    On every close, log to the closed-trades section with:
+    - profit_pct at close
+    - armed (ever > 0%)
+    - close_reason: 'STOP_LOSS' or 'TRAILING_GIVEBACK'
     """
     remaining_positions = []
     new_state = {}
@@ -355,12 +505,21 @@ def apply_trading_logic(positions, prior_state):
         prev_ath = float(prev.get("ath_pct", 0.0))
         profit_pct = pos["profit_pct"]
 
+        # Whether this position has ever been positive based on prior ATH
+        previously_armed = prev_ath > 0.0 or bool(prev.get("armed", False))
+
         # 1) Hard stop loss always active
         if profit_pct <= -STOP_LOSS_PCT:
             logging.info(
                 f"{key}: Profit {profit_pct:.2f}% <= -STOP_LOSS_PCT (-{STOP_LOSS_PCT}%), "
                 f"triggering STOP LOSS sell."
             )
+            try:
+                # Log closed trade BEFORE sending close request
+                log_closed_trade(ws, pos, previously_armed, prev_ath, "STOP_LOSS")
+            except Exception as e:
+                logging.error(f"Failed to log STOP_LOSS close for {key}: {e}")
+
             close_position(pos["instrument"], pos["side"])
             continue
 
@@ -395,6 +554,11 @@ def apply_trading_logic(positions, prior_state):
                 f"allowed_drawdown({allowed_drawdown:.2f}%), triggering "
                 f"TRAILING GIVEBACK sell at level {exit_level:.2f}%."
             )
+            try:
+                log_closed_trade(ws, pos, True, ath_pct, "TRAILING_GIVEBACK")
+            except Exception as e:
+                logging.error(f"Failed to log TRAILING_GIVEBACK close for {key}: {e}")
+
             close_position(pos["instrument"], pos["side"])
             continue
 
@@ -419,11 +583,6 @@ def main_loop():
     client = get_gspread_client()
     ws = get_or_create_worksheet(client)
 
-    # Ensure header exists at least once
-    if not ws.get_all_values():
-        logging.info("Initializing worksheet header.")
-        write_positions_to_sheet(ws, [], {})
-
     while True:
         try:
             logging.info("Fetching open positions from Oanda...")
@@ -436,7 +595,7 @@ def main_loop():
                 logging.info(f"Found {len(positions)} open position side(s).")
 
                 prior_state = load_prior_state(ws)
-                remaining_positions, new_state = apply_trading_logic(positions, prior_state)
+                remaining_positions, new_state = apply_trading_logic(positions, prior_state, ws)
 
                 logging.info(f"{len(remaining_positions)} position side(s) remain open after logic.")
                 write_positions_to_sheet(ws, remaining_positions, new_state)
