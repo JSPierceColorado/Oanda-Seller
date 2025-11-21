@@ -33,7 +33,7 @@ WORKSHEET_NAME = os.getenv("WORKSHEET_NAME", "Oanda-Trader")
 # Values are percentages, e.g. 0.3 = 0.3% move on price
 STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.3"))  # hard stop, e.g. 0.3%
 
-# New trailing logic:
+# Trailing logic parameters:
 # TRAIL_GIVEBACK_FRACTION: fraction of peak profit we allow to be given back, e.g. 0.3 = 30%
 # MIN_TRAIL_DROP_PCT: minimum absolute drawdown between ATH and exit, e.g. 0.2 = 0.2%
 TRAIL_GIVEBACK_FRACTION = float(os.getenv("TRAIL_GIVEBACK_FRACTION", "0.3"))
@@ -90,7 +90,7 @@ logging.basicConfig(
 logging.info(
     f"Using risk settings: "
     f"STOP_LOSS_PCT={STOP_LOSS_PCT}%, "
-    f"TRAIL_GIVEBACK_FRACTION={TRAIL_GIVEBACK_FRACTION}, "
+    f"TRAIL_GIVEBACK_FRACTION={TRAIL_GIVEBACK_FRACTION}%, "
     f"MIN_TRAIL_DROP_PCT={MIN_TRAIL_DROP_PCT}%, "
     f"ARM_THRESHOLD_PCT={ARM_THRESHOLD_PCT}%, "
     f"TRAIL_OFFSET_PCT={TRAIL_OFFSET_PCT}%, "
@@ -350,8 +350,8 @@ def load_prior_state(ws):
         key -> {"armed": bool, "ath_pct": float}
     where key = f"{Instrument}|{Side}"
 
-    'armed' here means: has EVER hit the arm threshold (or positive territory
-    in older runs before ARM_THRESHOLD_PCT existed).
+    'armed' here is the trailing-armed state as of the last snapshot for that
+    position side.
     """
     try:
         values = ws.get_all_values()
@@ -451,8 +451,8 @@ def log_closed_trade(ws, pos, armed: bool, ath_pct: float, close_reason: str):
     Append a closed-trade row into the log area on the right side of the sheet.
 
     pos: position dict from fetch_open_positions()
-    armed: whether the position has ever hit the trailing arm threshold
-    ath_pct: all-time-high profit percentage
+    armed: whether trailing was armed at the time of close
+    ath_pct: all-time-high profit percentage during the last armed cycle
     close_reason: 'STOP_LOSS' or 'TRAILING_GIVEBACK'
     """
     closed_at = datetime.now(timezone.utc).isoformat()
@@ -492,11 +492,13 @@ def log_closed_trade(ws, pos, armed: bool, ath_pct: float, close_reason: str):
 def apply_trading_logic(positions, prior_state, ws):
     """
     Trading logic with:
+
     - Hard STOP_LOSS_PCT always active.
     - ATH-based trailing with percentage giveback.
     - ARM_THRESHOLD_PCT: trailing only activates once ATH >= ARM_THRESHOLD_PCT.
     - TRAIL_OFFSET_PCT: extra buffer below the trail.
-    - If profit_pct <= 0%, trailing is disabled for that tick (hard SL only).
+    - If profit_pct <= 0%, trailing is disabled for that tick AND the
+      trailing state is reset (unarmed, ATH reset to 0).
     - Trailing exit level is clamped to >= 0%, so TRAILING_GIVEBACK never
       closes at a loss.
     """
@@ -521,7 +523,7 @@ def apply_trading_logic(positions, prior_state, ws):
                 f"triggering STOP LOSS sell."
             )
             try:
-                # For STOP_LOSS, 'armed' is whether it has ever hit arm threshold in the past
+                # For STOP_LOSS, use previous armed/ATH state
                 log_closed_trade(ws, pos, prev_armed, prev_ath, "STOP_LOSS")
             except Exception as e:
                 logging.error(f"Failed to log STOP_LOSS close for {key}: {e}")
@@ -530,7 +532,7 @@ def apply_trading_logic(positions, prior_state, ws):
             continue
 
         # ---------------------
-        # 2) Update ATH (only positive)
+        # 2) Update ATH while profitable
         # ---------------------
         ath_pct = prev_ath
         if profit_pct > 0.0 and profit_pct > prev_ath:
@@ -538,34 +540,32 @@ def apply_trading_logic(positions, prior_state, ws):
             logging.info(f"{key}: New all-time high profit {ath_pct:.2f}%.")
 
         # ---------------------
-        # 3) Determine if we've ever hit the arm threshold
+        # 3) If unprofitable (<= 0%), unarm and reset ATH
         # ---------------------
-        # If ARM_THRESHOLD_PCT <= 0, treat any positive ATH as enough to arm.
-        threshold = max(0.0, ARM_THRESHOLD_PCT)
-        hit_threshold_now = ath_pct >= threshold and ath_pct > 0.0
-        has_ever_hit_threshold = prev_armed or hit_threshold_now
-
-        # If we've NEVER hit the threshold, keep open with only hard SL.
-        if not has_ever_hit_threshold:
+        if profit_pct <= 0.0:
+            if prev_armed or prev_ath > 0.0:
+                logging.info(
+                    f"{key}: Profit {profit_pct:.2f}% <= 0%, resetting trailing state "
+                    f"(unarmed, ATH reset)."
+                )
             remaining_positions.append(pos)
             new_state[key] = {
                 "armed": False,
-                "ath_pct": ath_pct,
+                "ath_pct": 0.0,
             }
             continue
 
         # ---------------------
-        # 4) If currently <= 0%, "unarm" trailing for this tick
+        # 4) Determine if we are armed (current cycle)
         # ---------------------
-        if profit_pct <= 0.0:
-            logging.info(
-                f"{key}: Profit {profit_pct:.2f}% <= 0%, disabling trailing giveback "
-                f"for now (hard SL only)."
-            )
+        threshold = max(0.0, ARM_THRESHOLD_PCT)
+        armed_now = prev_armed or (ath_pct >= threshold and ath_pct > 0.0)
+
+        # If not yet armed, keep open with updated ATH, no trailing yet
+        if not armed_now:
             remaining_positions.append(pos)
             new_state[key] = {
-                # 'armed' means it has EVER hit the threshold, useful for logging
-                "armed": has_ever_hit_threshold,
+                "armed": False,
                 "ath_pct": ath_pct,
             }
             continue
@@ -591,8 +591,7 @@ def apply_trading_logic(positions, prior_state, ws):
                 f"trail level {exit_level:.2f}% (ATH {ath_pct:.2f}%, "
                 f"allowed_drawdown {allowed_drawdown:.2f}%, "
                 f"offset {TRAIL_OFFSET_PCT:.2f}%), "
-                f"triggering TRAILING G
-IVEBACK sell."
+                f"triggering TRAILING_GIVEBACK sell."
             )
             try:
                 log_closed_trade(ws, pos, True, ath_pct, "TRAILING_GIVEBACK")
@@ -607,7 +606,7 @@ IVEBACK sell."
         # ---------------------
         remaining_positions.append(pos)
         new_state[key] = {
-            "armed": has_ever_hit_threshold,
+            "armed": True,
             "ath_pct": ath_pct,
         }
 
